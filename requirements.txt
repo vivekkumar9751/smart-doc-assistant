@@ -34,7 +34,7 @@ langsmith==0.4.1
 MarkupSafe==3.0.2
 narwhals==1.44.0
 numpy==2.3.1
-openai==1.91.0
+openai==0.28
 orjson==3.10.18
 packaging==24.2
 pandas==2.3.0
@@ -75,3 +75,4 @@ tzdata==2025.2
 urllib3==2.5.0
 uvicorn==0.34.3
 zstandard==0.23.0
+streamlit
