@@ -5,13 +5,15 @@ from pydantic import BaseModel
 from typing import List
 import asyncio
 import logging
+import os
 
 from backend.document_utils import extract_text_from_pdf, extract_text_from_txt
 from backend.qa_logic import (
     generate_summary,
     answer_question,
     generate_challenge_questions,
-    evaluate_user_answers
+    evaluate_user_answers,
+    health_check as openai_health_check
 )
 
 import traceback
@@ -87,6 +89,15 @@ async def upload_file(file: UploadFile = File(...)):
         except asyncio.TimeoutError:
             summary = "Summary generation timed out. Please try again with a smaller document."
             doc_store["summary"] = summary
+        except Exception as e:
+            error_msg = str(e)
+            if "quota" in error_msg.lower() or "exceeded" in error_msg.lower():
+                summary = "❌ OpenAI quota exceeded. Please check your billing at https://platform.openai.com/usage"
+            elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
+                summary = "❌ Invalid API key. Please check your .env configuration."
+            else:
+                summary = f"❌ Error generating summary: {error_msg}"
+            doc_store["summary"] = summary
 
         logger.info("Upload and processing completed successfully")
         
@@ -107,7 +118,34 @@ async def upload_file(file: UploadFile = File(...)):
 # Health check endpoint
 @app.get("/health")
 async def health_check():
+    """Basic health check for the API"""
     return {"status": "healthy", "message": "API is running"}
+
+# OpenAI health check endpoint
+@app.get("/health/openai")
+async def openai_health():
+    """Check OpenAI API connectivity and quota status"""
+    try:
+        health_result = await asyncio.get_event_loop().run_in_executor(
+            None, openai_health_check
+        )
+        return health_result
+    except Exception as e:
+        return {
+            "status": "unhealthy", 
+            "message": f"OpenAI API check failed: {str(e)}"
+        }
+
+# Environment info endpoint (for debugging)
+@app.get("/health/env")
+async def environment_info():
+    """Get environment information for debugging"""
+    return {
+        "environment": os.getenv("ENVIRONMENT", "unknown"),
+        "python_version": os.sys.version,
+        "api_key_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "api_key_format_valid": bool(os.getenv("OPENAI_API_KEY", "").startswith("sk-"))
+    }
 
 # Get document summary
 @app.get("/doc/")
@@ -142,9 +180,16 @@ async def ask_question(data: QuestionRequest):
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="Question processing timed out. Please try a simpler question.")
     except Exception as e:
-        logger.error(f"Error in /ask/: {str(e)}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Error answering the question.")
+        error_msg = str(e)
+        logger.error(f"Error in /ask/: {error_msg}")
+        
+        # Handle specific OpenAI errors
+        if "quota" in error_msg.lower() or "exceeded" in error_msg.lower():
+            raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Please check your billing.")
+        elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Invalid OpenAI API key.")
+        else:
+            raise HTTPException(status_code=500, detail="Error answering the question.")
 
 # Generate challenge questions with timeout
 @app.get("/challenge/")
@@ -167,9 +212,16 @@ async def challenge_questions():
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="Challenge question generation timed out.")
     except Exception as e:
-        logger.error(f"Error in /challenge/: {str(e)}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Error generating challenge questions.")
+        error_msg = str(e)
+        logger.error(f"Error in /challenge/: {error_msg}")
+        
+        # Handle specific OpenAI errors
+        if "quota" in error_msg.lower() or "exceeded" in error_msg.lower():
+            raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Please check your billing.")
+        elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Invalid OpenAI API key.")
+        else:
+            raise HTTPException(status_code=500, detail="Error generating challenge questions.")
 
 # Evaluate user answers with timeout
 class AnswerItem(BaseModel):
@@ -195,6 +247,13 @@ async def evaluate_answers(data: AnswerRequest):
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="Answer evaluation timed out.")
     except Exception as e:
-        logger.error(f"Error in /evaluate/: {str(e)}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Error evaluating answers.")
+        error_msg = str(e)
+        logger.error(f"Error in /evaluate/: {error_msg}")
+        
+        # Handle specific OpenAI errors
+        if "quota" in error_msg.lower() or "exceeded" in error_msg.lower():
+            raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Please check your billing.")
+        elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Invalid OpenAI API key.")
+        else:
+            raise HTTPException(status_code=500, detail="Error evaluating answers.")

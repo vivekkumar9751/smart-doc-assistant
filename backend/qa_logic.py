@@ -1,67 +1,143 @@
-# ✅ Updated qa_logic.py for OpenAI API with modern client
-
 import os
 import time
+import re
 from typing import List
 from dotenv import load_dotenv
-from openai import OpenAI
+from groq import Groq
 import logging
+from functools import wraps
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
 
-if not api_key:
-    raise ValueError("❌ OPENAI_API_KEY not loaded properly. Check your .env setup.")
+def validate_api_key(api_key: str) -> bool:
+    """Validate Groq API key format"""
+    if not api_key:
+        return False
+    
+    if not api_key.startswith('gsk_'):
+        return False
+    
+    api_key = api_key.strip().replace('\n', '').replace(' ', '')
+    
+    if len(api_key) < 20:
+        return False
+        
+    return True
 
-# Initialize OpenAI client
-client = OpenAI(api_key=api_key)
-logger.info("✅ OPENAI_API_KEY loaded successfully.")
+def get_validated_api_key():
+    """Get and validate API key from environment"""
+    api_key = os.getenv("GROQ_API_KEY")
+    
+    if not api_key:
+        raise ValueError(
+            "❌ GROQ_API_KEY not found in environment variables. "
+            "Please check your .env file and ensure it's properly configured."
+        )
+    
+    api_key = api_key.strip().replace('\n', '').replace(' ', '')
+    
+    if not validate_api_key(api_key):
+        raise ValueError(
+            "❌ GROQ_API_KEY format is invalid. "
+            "Please ensure your API key is correct and on a single line."
+        )
+    
+    return api_key
 
-# Enhanced retry wrapper for rate limiting and errors
-def safe_chat_completion_create(**kwargs):
-    for attempt in range(3):
+try:
+    api_key = get_validated_api_key()
+    client = Groq(api_key=api_key)
+    logger.info("✅ Groq API client initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Groq client: {str(e)}")
+    raise
+
+def handle_groq_errors(func):
+    """Decorator to handle Groq API errors consistently"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
         try:
-            return client.chat.completions.create(**kwargs)
+            return func(*args, **kwargs)
         except Exception as e:
             error_msg = str(e).lower()
             
-            # Handle quota exceeded specifically
-            if "insufficient_quota" in error_msg or "exceeded your current quota" in error_msg:
-                logger.error("🚫 OpenAI API quota exceeded!")
-                raise Exception(
-                    "🚫 OpenAI API quota exceeded. Please:\n"
-                    "1. Check your OpenAI billing: https://platform.openai.com/account/billing\n"
-                    "2. Add payment method or upgrade your plan\n"
-                    "3. Or try again later if on free tier\n"
-                    "The app will use fallback responses until this is resolved."
+            if "quota" in error_msg or "exceeded" in error_msg:
+                return (
+                    "❌ API quota exceeded. Please check your Groq account at "
+                    "https://console.groq.com/. You may need to add more credits or upgrade your plan."
                 )
-            
-            # Handle rate limits (temporary)
-            elif "rate_limit" in error_msg or "rate limit" in error_msg:
-                wait_time = 2 ** attempt  # Exponential backoff
-                logger.warning(f"⚠️ Rate limit hit (attempt {attempt + 1}/3), retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            
-            # Handle other API errors
-            elif attempt == 2:  # Last attempt
-                logger.error(f"❌ Failed after 3 retries: {str(e)}")
-                raise e
+            elif "invalid" in error_msg and "api" in error_msg:
+                return (
+                    "❌ Invalid API key. Please check your Groq API key in the .env file. "
+                    "Get a new key at https://console.groq.com/keys"
+                )
+            elif "rate" in error_msg and "limit" in error_msg:
+                return (
+                    "❌ Rate limit exceeded. Please wait a moment and try again. "
+                    "Consider upgrading your Groq plan for higher rate limits."
+                )
+            elif "timeout" in error_msg:
+                return "❌ Request timeout. Please try again with a shorter document or check your internet connection."
             else:
-                logger.warning(f"⚠️ API error (attempt {attempt + 1}/3): {str(e)}")
-                time.sleep(1)
+                logger.error(f"Unexpected API error: {str(e)}")
+                return f"❌ API Error: {str(e)}"
     
-    raise Exception("❌ Failed after 3 retries due to API errors.")
+    return wrapper
 
+def safe_chat_completion_create(**kwargs):
+    """Make API calls with retry logic and proper error handling"""
+    max_retries = 3
+    base_delay = 1
+    
+    for attempt in range(max_retries):
+        try:
+            if 'timeout' not in kwargs:
+                kwargs['timeout'] = 30
+                
+            response = client.chat.completions.create(**kwargs)
+            return response
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            if "quota" in error_msg or "exceeded" in error_msg:
+                raise Exception(
+                    "API quota exceeded. Please check your Groq billing at https://console.groq.com/"
+                )
+            elif "invalid" in error_msg and ("key" in error_msg or "token" in error_msg):
+                raise Exception(
+                    "Invalid API key. Please check your GROQ_API_KEY in .env file"
+                )
+            elif "rate" in error_msg and "limit" in error_msg:
+                if attempt < max_retries - 1:
+                    wait_time = base_delay * (2 ** attempt)
+                    logger.warning(f"⚠️ Rate limit hit (attempt {attempt + 1}/{max_retries}), retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise Exception("Rate limit exceeded. Please try again later or upgrade your Groq plan.")
+            elif attempt < max_retries - 1:
+                wait_time = base_delay * (2 ** attempt)
+                logger.warning(f"⚠️ API error (attempt {attempt + 1}/{max_retries}): {str(e)}, retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+            else:
+                raise e
+    
+    raise Exception("Failed after maximum retries")
+
+@handle_groq_errors
 def generate_summary(document_text):
+    """Generate document summary with enhanced error handling"""
     try:
         logger.info("Generating document summary...")
         
-        # Limit text length for summary generation
         text_for_summary = document_text[:4000] if len(document_text) > 4000 else document_text
         
         prompt = (
@@ -71,7 +147,7 @@ def generate_summary(document_text):
         )
 
         response = safe_chat_completion_create(
-            model="gpt-3.5-turbo",
+            model="llama3-8b-8192",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=200,
@@ -79,30 +155,19 @@ def generate_summary(document_text):
         )
 
         summary = response.choices[0].message.content.strip()
-        logger.info("Summary generated successfully")
+        logger.info("✅ Summary generated successfully")
         return summary
         
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error generating summary: {error_msg}")
-        
-        # Provide fallback summary when quota exceeded
-        if "quota exceeded" in error_msg or "insufficient_quota" in error_msg:
-            return (
-                "⚠️ AI Summary unavailable (OpenAI quota exceeded)\n\n"
-                "📄 FALLBACK SUMMARY:\n"
-                f"Document contains {len(document_text)} characters. "
-                f"Here's the beginning:\n\n{document_text[:300]}...\n\n"
-                "💡 To get AI-powered summaries, please check your OpenAI billing settings."
-            )
-        
-        return f"Error generating summary: {error_msg}"
+        logger.error(f"❌ Error generating summary: {str(e)}")
+        raise e
 
+@handle_groq_errors
 def answer_question(document_text, user_question):
+    """Answer user questions with enhanced error handling"""
     try:
         logger.info(f"Processing question: {user_question[:50]}...")
         
-        # Limit context for better performance
         context_text = document_text[:4000] if len(document_text) > 4000 else document_text
         
         prompt = (
@@ -115,181 +180,139 @@ def answer_question(document_text, user_question):
         )
 
         response = safe_chat_completion_create(
-            model="gpt-3.5-turbo",
+            model="llama3-8b-8192",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=300,
             timeout=30
         )
 
         answer = response.choices[0].message.content.strip()
-        logger.info("Question answered successfully")
+        logger.info("✅ Question answered successfully")
         return answer
         
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error answering question: {error_msg}")
-        
-        # Provide fallback response when quota exceeded
-        if "quota exceeded" in error_msg or "insufficient_quota" in error_msg:
-            return (
-                "⚠️ AI Q&A unavailable (OpenAI quota exceeded)\n\n"
-                "📝 FALLBACK RESPONSE:\n"
-                f"I cannot provide an AI-powered answer to: '{user_question}'\n\n"
-                "You can manually search the document for relevant information. "
-                "To restore AI functionality, please check your OpenAI billing settings."
-            )
-        
-        return f"Error processing your question: {error_msg}"
+        logger.error(f"❌ Error answering question: {str(e)}")
+        raise e
 
+@handle_groq_errors
 def generate_challenge_questions(document_text):
+    """Generate challenge questions with enhanced error handling"""
     try:
         logger.info("Generating challenge questions...")
         
-        # Limit context for better performance
-        context_text = document_text[:4000] if len(document_text) > 4000 else document_text
+        text_for_challenge = document_text[:3000] if len(document_text) > 3000 else document_text
         
         prompt = (
-            "Based on the document below, generate exactly 3 comprehension questions "
-            "that test understanding of key concepts. Make them thought-provoking but answerable. "
-            "Return only the questions, numbered 1-3, one per line:\n\n"
-            f"Document:\n{context_text}"
+            "Based on the following document, create exactly 3 multiple-choice questions "
+            "to test comprehension. For each question, provide 4 options (A, B, C, D) "
+            "and indicate the correct answer. Format your response as:\n\n"
+            "Question 1: [question text]\n"
+            "A) [option A]\n"
+            "B) [option B]\n"
+            "C) [option C]\n"
+            "D) [option D]\n"
+            "Correct Answer: [A/B/C/D]\n\n"
+            "Continue this format for all 3 questions.\n\n"
+            f"Document:\n{text_for_challenge}"
         )
 
         response = safe_chat_completion_create(
-            model="gpt-3.5-turbo",
+            model="llama3-8b-8192",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=400,
-            timeout=30
+            temperature=0.4,
+            max_tokens=800,
+            timeout=45
         )
 
-        questions_raw = response.choices[0].message.content.strip()
+        questions_text = response.choices[0].message.content.strip()
         
-        # Parse questions more reliably
-        questions = []
-        for line in questions_raw.split('\n'):
-            line = line.strip()
-            if line and (line[0].isdigit() or line.startswith('Q')):
-                # Remove numbering and clean up
-                clean_question = line.split('.', 1)[-1].strip()
-                if clean_question:
-                    questions.append(clean_question)
+        questions = parse_challenge_questions(questions_text)
         
-        # Ensure we have exactly 3 questions
-        questions = questions[:3]
-        if len(questions) < 3:
-            questions.extend([
-                "What are the main points discussed in this document?",
-                "What conclusions can you draw from the information presented?",
-                "How would you summarize the key findings or arguments?"
-            ])
-            questions = questions[:3]
-            
-        logger.info(f"Generated {len(questions)} challenge questions")
+        logger.info(f"✅ Generated {len(questions)} challenge questions successfully")
         return questions
         
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error generating challenge questions: {error_msg}")
-        
-        # Provide fallback questions when quota exceeded
-        if "quota exceeded" in error_msg or "insufficient_quota" in error_msg:
-            return [
-                "⚠️ What are the main topics covered in this document? (AI generation unavailable - quota exceeded)",
-                "⚠️ What are the key conclusions or findings mentioned? (Please check OpenAI billing)",
-                "⚠️ What questions does this document raise for further research? (Fallback question)"
-            ]
-        
-        return [
-            "What are the main topics covered in this document?",
-            "What are the key conclusions or findings?",
-            "What questions does this document raise for further research?"
-        ]
+        logger.error(f"❌ Error generating challenge questions: {str(e)}")
+        raise e
 
+@handle_groq_errors
 def evaluate_user_answers(document_text, qa_pairs: List[dict]):
+    """Evaluate user answers with enhanced error handling"""
     try:
-        logger.info(f"Evaluating {len(qa_pairs)} user answers...")
+        logger.info("Evaluating user answers...")
         
-        feedback = []
-        context_text = document_text[:4000] if len(document_text) > 4000 else document_text
+        evaluation_items = []
+        for i, qa in enumerate(qa_pairs, 1):
+            evaluation_items.append(f"Question {i}: {qa['question']}")
+            evaluation_items.append(f"User Answer: {qa['user_answer']}")
+            evaluation_items.append(f"Correct Answer: {qa['correct_answer']}")
+            evaluation_items.append("")
+        
+        evaluation_text = "\n".join(evaluation_items)
+        
+        prompt = (
+            "Evaluate the user's answers to these questions based on the document. "
+            "For each question, determine if the user's answer is correct and provide brief feedback. "
+            "Format your response as:\n\n"
+            "Question 1: ✅ Correct / ❌ Incorrect\n"
+            "Feedback: [brief explanation]\n\n"
+            "Then provide an overall score and summary.\n\n"
+            f"Document excerpt:\n{document_text[:2000]}\n\n"
+            f"Questions and Answers to evaluate:\n{evaluation_text}"
+        )
 
-        for pair in qa_pairs:
-            question = pair["question"]
-            user_answer = pair["answer"]
-            
-            if not user_answer.strip():
-                feedback.append({
-                    "question": question,
-                    "user_answer": "No answer provided",
-                    "evaluation": "Please provide an answer to receive feedback."
-                })
-                continue
+        response = safe_chat_completion_create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=600,
+            timeout=40
+        )
 
-            prompt = (
-                f"Document:\n{context_text}\n\n"
-                f"Question: {question}\n"
-                f"Student's Answer: {user_answer}\n\n"
-                "Evaluate the student's answer based on the document. "
-                "Provide constructive feedback on accuracy, completeness, and understanding. "
-                "Be encouraging but honest about areas for improvement."
-            )
-
-            try:
-                response = safe_chat_completion_create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=300,
-                    timeout=30
-                )
-
-                evaluation = response.choices[0].message.content.strip()
-                
-            except Exception as e:
-                error_msg = str(e)
-                
-                # Provide fallback evaluation when quota exceeded
-                if "quota exceeded" in error_msg or "insufficient_quota" in error_msg:
-                    evaluation = (
-                        "⚠️ AI evaluation unavailable (OpenAI quota exceeded)\n\n"
-                        f"Your answer: '{user_answer}'\n\n"
-                        "Manual review suggested: Compare your answer with the document content. "
-                        "For AI-powered feedback, please resolve the OpenAI billing issue."
-                    )
-                else:
-                    evaluation = f"Error evaluating this answer: {error_msg}"
-
-            feedback.append({
-                "question": question,
-                "user_answer": user_answer,
-                "evaluation": evaluation
-            })
-
-        logger.info("Answer evaluation completed")
-        return feedback
+        evaluation = response.choices[0].message.content.strip()
+        logger.info("✅ User answers evaluated successfully")
+        return evaluation
         
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error evaluating answers: {error_msg}")
-        
-        # Provide fallback when quota exceeded
-        if "quota exceeded" in error_msg or "insufficient_quota" in error_msg:
-            return [{
-                "question": "OpenAI Quota Exceeded",
-                "user_answer": "Service Unavailable",
-                "evaluation": (
-                    "⚠️ AI evaluation is currently unavailable due to OpenAI quota limits.\n\n"
-                    "💡 To resolve this:\n"
-                    "1. Visit: https://platform.openai.com/account/billing\n"
-                    "2. Add payment method or upgrade your plan\n"
-                    "3. Check your usage limits\n\n"
-                    "The app will work normally once this is resolved."
-                )
-            }]
-        
-        return [{
-            "question": "Error",
-            "user_answer": "Error",
-            "evaluation": f"Error during evaluation: {error_msg}"
-        }]
+        logger.error(f"❌ Error evaluating answers: {str(e)}")
+        raise e
+
+def parse_challenge_questions(questions_text):
+    """Parse generated questions into structured format"""
+    questions = []
+    lines = questions_text.split('\n')
+    current_question = {}
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        if line.startswith('Question '):
+            if current_question:
+                questions.append(current_question)
+            current_question = {'question': line.split(':', 1)[1].strip()}
+        elif line.startswith(('A)', 'B)', 'C)', 'D)')):
+            option_key = line[0].lower()
+            option_text = line[2:].strip()
+            if 'options' not in current_question:
+                current_question['options'] = {}
+            current_question['options'][option_key] = option_text
+        elif line.startswith('Correct Answer:'):
+            current_question['correct_answer'] = line.split(':', 1)[1].strip().lower()
+    
+    if current_question:
+        questions.append(current_question)
+    
+    return questions
+
+def health_check():
+    """Health check function for the API"""
+    try:
+        if client:
+            return {"status": "healthy", "service": "groq", "message": "Groq API client is ready"}
+        else:
+            return {"status": "unhealthy", "message": "Groq client not initialized"}
+    except Exception as e:
+        return {"status": "unhealthy", "message": f"Health check failed: {str(e)}"}
